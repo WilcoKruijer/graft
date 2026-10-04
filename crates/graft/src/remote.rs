@@ -8,16 +8,19 @@ use futures::{
     stream::{self, FuturesOrdered},
 };
 use opendal::{
-    ErrorKind, Operator,
+    Builder, ErrorKind, Operator,
     layers::{HttpClientLayer, RetryLayer},
     options::{ReadOptions, WriteOptions},
     raw::HttpClient,
-    services::{Fs, Memory, S3},
+    services::{Fs, Gcs, Memory, S3},
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub mod segment;
+
+#[cfg(test)]
+mod gcs_tests;
 
 const REMOTE_CONCURRENCY: usize = 5;
 
@@ -96,12 +99,35 @@ pub enum RemoteConfig {
         bucket: String,
         prefix: Option<String>,
     },
+
+    /// Google Cloud Storage using native generation preconditions, not S3 interoperability.
+    /// Credentials are loaded from Google application credentials or the metadata server.
+    Gcs {
+        bucket: String,
+        prefix: Option<String>,
+    },
 }
 
 impl RemoteConfig {
     pub fn build(self) -> Result<Remote> {
         Remote::with_config(self)
     }
+}
+
+fn build_cloud_operator(builder: impl Builder) -> Result<Operator> {
+    let client = reqwest::ClientBuilder::new()
+        // HTTP/2 routes all requests through a single connection, limiting throughput.
+        .http1_only()
+        .hickory_dns(true)
+        .connect_timeout(Duration::from_secs(5));
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    let client = client.tcp_user_timeout(Duration::from_secs(60));
+    let client = client.build()?;
+
+    Ok(Operator::new(builder)?
+        .layer(HttpClientLayer::new(HttpClient::with(client)))
+        .layer(RetryLayer::new())
+        .finish())
 }
 
 #[derive(Debug, Clone)]
@@ -122,20 +148,14 @@ impl Remote {
                 if let Ok(endpoint) = std::env::var("AWS_ENDPOINT_URL") {
                     builder = builder.endpoint(&endpoint);
                 }
-                let client = reqwest::ClientBuilder::new()
-                    // use http1 to maximize throughput
-                    // http2 routes all requests through a single connection
-                    .http1_only()
-                    // enable hickory DNS resolver for DNS caching
-                    .hickory_dns(true)
-                    .connect_timeout(Duration::from_secs(5))
-                    .tcp_user_timeout(Duration::from_secs(60))
-                    .build()?;
-
-                Operator::new(builder)?
-                    .layer(HttpClientLayer::new(HttpClient::with(client)))
-                    .layer(RetryLayer::new())
-                    .finish()
+                build_cloud_operator(builder)?
+            }
+            RemoteConfig::Gcs { bucket, prefix } => {
+                let mut builder = Gcs::default().bucket(&bucket);
+                if let Some(prefix) = prefix {
+                    builder = builder.root(&prefix);
+                }
+                build_cloud_operator(builder)?
             }
         };
 
@@ -182,20 +202,35 @@ impl Remote {
         }
     }
 
-    /// Atomically write a commit to the remote, returning
-    /// `RemoteErr::ObjectStore(Error::AlreadyExists)` on a collision
+    /// Atomically write a commit to the remote, returning a precondition failure on a collision
     #[tracing::instrument(level = "debug", err(level = "debug"), skip(self, commit),
         fields(log = %commit.log, lsn = %commit.lsn, sid = ?commit.segment_id())
     )]
     pub async fn put_commit(&self, commit: &Commit) -> Result<()> {
         let path = RemotePath::Commit(commit.log(), commit.lsn()).build();
+        let payload = commit.encode_to_bytes();
+        let chunk_size = payload.len();
+        if self
+            .store
+            .info()
+            .full_capability()
+            .write_multi_max_size
+            .is_some_and(|maximum| chunk_size > maximum)
+        {
+            return Err(opendal::Error::new(
+                ErrorKind::Unsupported,
+                "Remote commit exceeds the maximum conditional single-part upload size",
+            )
+            .into());
+        }
         self.store
             .write_options(
                 &path,
-                commit.encode_to_bytes(),
+                payload,
                 WriteOptions {
-                    // Perform an atomic write operation, returning
-                    // a precondition error if the commit already exists
+                    // GCS media uploads honor ifGenerationMatch=0, but its XML multipart
+                    // path does not. Keep the entire commit in one conditional upload.
+                    chunk: Some(chunk_size),
                     if_not_exists: true,
                     concurrent: REMOTE_CONCURRENCY,
                     ..WriteOptions::default()
